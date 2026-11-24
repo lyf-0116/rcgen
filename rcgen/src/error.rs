@@ -45,6 +45,10 @@ pub enum Error {
 	InvalidCrlNextUpdate,
 	/// CRL issuer specifies Key Usages that don't include cRLSign.
 	IssuerNotCrlSigner,
+	/// Issuer does not have the CA basic constraints required to sign certificates.
+	IssuerNotCertificateAuthority,
+	/// Issuer specifies Key Usages that don't include keyCertSign.
+	IssuerMissingKeyCertSign,
 	/// Name constraints must contain at least one permitted or excluded subtree.
 	EmptyNameConstraints,
 	/// A CRL distribution point was specified without any URIs.
@@ -102,6 +106,16 @@ impl fmt::Display for Error {
 			IssuerNotCrlSigner => write!(
 				f,
 				"CRL issuer must specify no key usage, or key usage including cRLSign"
+			)?,
+			IssuerNotCertificateAuthority => write!(
+				f,
+				"Issuer must be a certificate authority (CA) with the \
+				basic constraints CA extension set to true"
+			)?,
+			IssuerMissingKeyCertSign => write!(
+				f,
+				"Issuer must specify no key usage, or key usage including \
+				keyCertSign"
 			)?,
 			EmptyNameConstraints => {
 				write!(f, "Name constraints must include at least one subtree")?

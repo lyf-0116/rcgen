@@ -202,8 +202,10 @@ impl CertificateSigningRequestParams {
 	/// `issuer`, and the authority key identifier extension will be populated using the subject
 	/// public key of `issuer`. It will be signed by `issuer_key`.
 	///
-	/// Note that no validation of the `issuer` certificate is performed. Rcgen will not require
-	/// the certificate to be a CA certificate, or have key usage extensions that allow signing.
+	/// The `issuer` is validated before signing: it must be a certificate authority
+	/// (basic constraints with cA set to true) and, when key usages are specified, the
+	/// `keyCertSign` usage must be included. Self-issued certificates, where the subject
+	/// and issuer share a distinguished name and key, are exempt from this check.
 	///
 	/// The returned [`Certificate`] may be serialized using [`Certificate::der`] and
 	/// [`Certificate::pem`].
@@ -223,7 +225,8 @@ mod tests {
 
 	use crate::{
 		BasicConstraints, CertificateParams, CertificateSigningRequestParams,
-		ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, PathLenConstraint,
+		DnType, Error, ExtendedKeyUsagePurpose, Issuer, KeyPair, KeyUsagePurpose,
+		PathLenConstraint,
 	};
 
 	#[test]
@@ -294,5 +297,29 @@ mod tests {
 		let csr_de = CertificateSigningRequestParams::from_der(csr.der()).unwrap();
 
 		assert_eq!(csr_de.params.basic_constraints, params.basic_constraints);
+	}
+
+	#[test]
+	fn end_entity_issuer_cannot_sign_csr_request() {
+		// The CSR-based issuance path goes through the same signing function as
+		// CertificateParams::signed_by, so an issuer without CA capabilities must
+		// be rejected there as well.
+		let (leaf_key, _) = KeyPair::generate().unwrap();
+		let leaf_params = CertificateParams::default();
+		let csr = leaf_params.serialize_request(&leaf_key).unwrap();
+		let csr = CertificateSigningRequestParams::from_der(csr.der()).unwrap();
+
+		let (issuer_key, _) = KeyPair::generate().unwrap();
+		let mut issuer_name = crate::DistinguishedName::new();
+		issuer_name.push(DnType::CommonName, "not a CA");
+		let issuer_params = CertificateParams {
+			distinguished_name: issuer_name,
+			basic_constraints: Some(BasicConstraints::EndEntity),
+			..CertificateParams::default()
+		};
+		let issuer = Issuer::new(issuer_params, issuer_key);
+
+		let err = csr.signed_by(&issuer).unwrap_err();
+		assert_eq!(err, Error::IssuerNotCertificateAuthority);
 	}
 }

@@ -202,11 +202,12 @@ impl<'a, S> AsRef<Certificate> for CertifiedIssuer<'a, S> {
 
 /// An issuer that can sign certificates.
 ///
-/// Encapsulates the distinguished name, key identifier method, key usages and signing key
-/// of the issuing certificate.
+/// Encapsulates the distinguished name, key identifier method, basic constraints, key usages
+/// and signing key of the issuing certificate.
 pub struct Issuer<'a, S> {
 	distinguished_name: Cow<'a, DistinguishedName>,
 	key_identifier_method: Cow<'a, KeyIdMethod>,
+	basic_constraints: Cow<'a, Option<BasicConstraints>>,
 	key_usages: Cow<'a, [KeyUsagePurpose]>,
 	signing_key: S,
 }
@@ -217,6 +218,7 @@ impl<'a, S: SigningKey> Issuer<'a, S> {
 		Self {
 			distinguished_name: Cow::Owned(params.distinguished_name),
 			key_identifier_method: Cow::Owned(params.key_identifier_method),
+			basic_constraints: Cow::Owned(params.basic_constraints),
 			key_usages: Cow::Owned(params.key_usages),
 			signing_key,
 		}
@@ -230,6 +232,7 @@ impl<'a, S: SigningKey> Issuer<'a, S> {
 		Self {
 			distinguished_name: Cow::Borrowed(&params.distinguished_name),
 			key_identifier_method: Cow::Borrowed(&params.key_identifier_method),
+			basic_constraints: Cow::Borrowed(&params.basic_constraints),
 			key_usages: Cow::Borrowed(&params.key_usages),
 			signing_key,
 		}
@@ -258,6 +261,7 @@ impl<'a, S: SigningKey> Issuer<'a, S> {
 			.map_err(|_| Error::CouldNotParseCertificate)?;
 
 		Ok(Self {
+			basic_constraints: Cow::Owned(BasicConstraints::from_x509(&x509)?),
 			key_usages: Cow::Owned(KeyUsagePurpose::from_x509(&x509)?),
 			key_identifier_method: Cow::Owned(KeyIdMethod::from_x509(&x509)?),
 			distinguished_name: Cow::Owned(DistinguishedName::from_name(
@@ -265,6 +269,11 @@ impl<'a, S: SigningKey> Issuer<'a, S> {
 			)?),
 			signing_key,
 		})
+	}
+
+	/// Basic constraints of this issuer, if present.
+	pub fn basic_constraints(&self) -> Option<BasicConstraints> {
+		*self.basic_constraints.as_ref()
 	}
 
 	/// Allowed key usages for this issuer.
@@ -276,6 +285,41 @@ impl<'a, S: SigningKey> Issuer<'a, S> {
 	pub fn key(&self) -> &S {
 		&self.signing_key
 	}
+
+	/// Check that this issuer is permitted to sign another certificate.
+	///
+	/// The issuer must be a CA (basic constraints with cA set to true) and, when key
+	/// usages are specified, include `keyCertSign`. Self-issued certificates, where the
+	/// subject and the issuer share a distinguished name and public key, are exempt: the
+	/// issuer is signing itself (e.g. a self-signed root), so its own constraints do not
+	/// gate the signature.
+	pub(crate) fn validate_cert_signer(
+		&self,
+		subject: &CertificateParams,
+		subject_public_key: &impl PublicKeyData,
+	) -> Result<(), Error> {
+		let self_issued = subject.distinguished_name == *self.distinguished_name
+			&& subject_public_key.subject_public_key_info()
+				== self.signing_key.subject_public_key_info();
+		if self_issued {
+			return Ok(());
+		}
+
+		if !matches!(
+			self.basic_constraints.as_ref(),
+			Some(BasicConstraints::Ca(_))
+		) {
+			return Err(Error::IssuerNotCertificateAuthority);
+		}
+
+		if !self.key_usages.is_empty()
+			&& !self.key_usages.contains(&KeyUsagePurpose::KeyCertSign)
+		{
+			return Err(Error::IssuerMissingKeyCertSign);
+		}
+
+		Ok(())
+	}
 }
 
 impl<'a, S> fmt::Debug for Issuer<'a, S> {
@@ -285,6 +329,7 @@ impl<'a, S> fmt::Debug for Issuer<'a, S> {
 		let Issuer {
 			distinguished_name,
 			key_identifier_method,
+			basic_constraints,
 			key_usages,
 			signing_key: _,
 		} = self;
@@ -292,6 +337,7 @@ impl<'a, S> fmt::Debug for Issuer<'a, S> {
 		f.debug_struct("Issuer")
 			.field("distinguished_name", distinguished_name)
 			.field("key_identifier_method", key_identifier_method)
+			.field("basic_constraints", basic_constraints)
 			.field("key_usages", key_usages)
 			.field("signing_key", &"[elided]")
 			.finish()

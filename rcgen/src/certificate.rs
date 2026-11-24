@@ -140,8 +140,10 @@ impl CertificateParams {
 	/// the subject public key of `issuer` (typically either a [`CertificateParams`] or
 	/// [`Certificate`]). It will be signed by `issuer_key`.
 	///
-	/// Note that no validation of the `issuer` certificate is performed. Rcgen will not require
-	/// the certificate to be a CA certificate, or have key usage extensions that allow signing.
+	/// The `issuer` is validated before signing: it must be a certificate authority
+	/// (basic constraints with cA set to true) and, when key usages are specified, the
+	/// `keyCertSign` usage must be included. Self-issued certificates, where the subject
+	/// and issuer share a distinguished name and key, are exempt from this check.
 	///
 	/// The returned [`Certificate`] may be serialized using [`Certificate::der`] and
 	/// [`Certificate::pem`].
@@ -329,6 +331,8 @@ impl CertificateParams {
 		pub_key: &K,
 		issuer: &Issuer<'_, impl SigningKey>,
 	) -> Result<CertificateDer<'static>, Error> {
+		issuer.validate_cert_signer(self, pub_key)?;
+
 		let pub_key_spki = pub_key.subject_public_key_info();
 		let extensions = self.extensions(&pub_key_spki, issuer)?;
 		let der = sign_der(&issuer.signing_key, |writer| {
@@ -1129,4 +1133,179 @@ PITGdT9dgN88nHPCle0B1+OY+OZ5
 			);
 		}
 	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn end_entity_issuer_cannot_sign_leaf() {
+		// An issuer explicitly marked as an end entity (cA:FALSE) must be rejected
+		// when it is asked to sign another certificate.
+		let (issuer_key, _) = KeyPair::generate().unwrap();
+		let issuer_params = CertificateParams {
+			distinguished_name: {
+				let mut name = DistinguishedName::new();
+				name.push(DnType::CommonName, "not a CA");
+				name
+			},
+			basic_constraints: Some(BasicConstraints::EndEntity),
+			key_usages: vec![KeyUsagePurpose::DigitalSignature],
+			..CertificateParams::default()
+		};
+		let issuer = Issuer::new(issuer_params, issuer_key);
+
+		let (leaf_key, _) = KeyPair::generate().unwrap();
+		let mut leaf_params =
+			CertificateParams::new(vec!["leaf.example.com".to_string()]).unwrap();
+		leaf_params.distinguished_name = {
+			let mut name = DistinguishedName::new();
+			name.push(DnType::CommonName, "leaf");
+			name
+		};
+
+		let err = leaf_params.signed_by(&leaf_key, &issuer).unwrap_err();
+		assert_eq!(err, Error::IssuerNotCertificateAuthority);
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn issuer_without_basic_constraints_cannot_sign_leaf() {
+		// An issuer with no basic constraints extension at all must be rejected.
+		let (issuer_key, _) = KeyPair::generate().unwrap();
+		let issuer_params = CertificateParams {
+			distinguished_name: {
+				let mut name = DistinguishedName::new();
+				name.push(DnType::CommonName, "constraintless");
+				name
+			},
+			basic_constraints: None,
+			..CertificateParams::default()
+		};
+		let issuer = Issuer::new(issuer_params, issuer_key);
+
+		let (leaf_key, _) = KeyPair::generate().unwrap();
+		let leaf_params = CertificateParams {
+			distinguished_name: {
+				let mut name = DistinguishedName::new();
+				name.push(DnType::CommonName, "leaf");
+				name
+			},
+			..CertificateParams::default()
+		};
+
+		let err = leaf_params.signed_by(&leaf_key, &issuer).unwrap_err();
+		assert_eq!(err, Error::IssuerNotCertificateAuthority);
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn ca_issuer_without_key_cert_sign_cannot_sign_leaf() {
+		// A CA whose key usages are specified but omit keyCertSign must be rejected.
+		let (issuer_key, _) = KeyPair::generate().unwrap();
+		let issuer_params = CertificateParams {
+			distinguished_name: {
+				let mut name = DistinguishedName::new();
+				name.push(DnType::CommonName, "CA without keyCertSign");
+				name
+			},
+			basic_constraints: Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained)),
+			key_usages: vec![KeyUsagePurpose::CrlSign],
+			..CertificateParams::default()
+		};
+		let issuer = Issuer::new(issuer_params, issuer_key);
+
+		let (leaf_key, _) = KeyPair::generate().unwrap();
+		let leaf_params = CertificateParams {
+			distinguished_name: {
+				let mut name = DistinguishedName::new();
+				name.push(DnType::CommonName, "leaf");
+				name
+			},
+			..CertificateParams::default()
+		};
+
+		let err = leaf_params.signed_by(&leaf_key, &issuer).unwrap_err();
+		assert_eq!(err, Error::IssuerMissingKeyCertSign);
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn valid_ca_issuer_can_sign_leaf() {
+		// A CA with the basic constraints extension is accepted, including when
+		// no key usages are specified (no key usage restriction).
+		for key_usages in [vec![KeyUsagePurpose::KeyCertSign], vec![]] {
+			let (issuer_key, _) = KeyPair::generate().unwrap();
+			let issuer_params = CertificateParams {
+				distinguished_name: {
+					let mut name = DistinguishedName::new();
+					name.push(DnType::CommonName, "proper CA");
+					name
+				},
+				basic_constraints: Some(BasicConstraints::Ca(
+					PathLenConstraint::Unconstrained,
+				)),
+				key_usages,
+				..CertificateParams::default()
+			};
+			let issuer = Issuer::new(issuer_params, issuer_key);
+
+			let (leaf_key, _) = KeyPair::generate().unwrap();
+			let leaf_params = CertificateParams {
+				distinguished_name: {
+					let mut name = DistinguishedName::new();
+					name.push(DnType::CommonName, "leaf");
+					name
+				},
+				..CertificateParams::default()
+			};
+
+			assert!(leaf_params.signed_by(&leaf_key, &issuer).is_ok());
+		}
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn self_signed_issuers_bypass_ca_capability_check() {
+		// Self-signed certificates go through the same signing function, but the
+		// issuer and subject are the same entity: an end-entity (or constraintless)
+		// self-signed certificate must still be produced, as must a normal root CA.
+		for basic_constraints in [
+			Some(BasicConstraints::EndEntity),
+			None,
+			Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained)),
+		] {
+			let (key, _) = KeyPair::generate().unwrap();
+			let params = CertificateParams {
+				basic_constraints,
+				..CertificateParams::default()
+			};
+			assert!(params.self_signed(&key).is_ok());
+		}
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn same_name_but_different_key_is_not_self_issued() {
+		// Matching distinguished names alone must not trigger the self-issued
+		// exemption: the public keys have to match as well.
+		let (issuer_key, _) = KeyPair::generate().unwrap();
+		let (leaf_key, _) = KeyPair::generate().unwrap();
+		let shared_name = {
+			let mut name = DistinguishedName::new();
+			name.push(DnType::CommonName, "shared name");
+			name
+		};
+		let issuer_params = CertificateParams {
+			distinguished_name: shared_name.clone(),
+			basic_constraints: Some(BasicConstraints::EndEntity),
+			..CertificateParams::default()
+		};
+		let issuer = Issuer::new(issuer_params, issuer_key);
+		let leaf_params = CertificateParams {
+			distinguished_name: shared_name,
+			..CertificateParams::default()
+		};
+
+		let err = leaf_params.signed_by(&leaf_key, &issuer).unwrap_err();
+		assert_eq!(err, Error::IssuerNotCertificateAuthority);
+	}
+
 }

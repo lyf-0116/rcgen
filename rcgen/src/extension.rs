@@ -440,7 +440,7 @@ pub enum BasicConstraints {
 }
 
 impl BasicConstraints {
-	#[cfg(all(test, feature = "x509-parser"))]
+	#[cfg(feature = "x509-parser")]
 	pub(crate) fn from_x509(
 		x509: &x509_parser::certificate::X509Certificate<'_>,
 	) -> Result<Option<Self>, Error> {
