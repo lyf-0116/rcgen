@@ -178,7 +178,7 @@ impl CertificateParams {
 		let (_remainder, x509) = x509_parser::parse_x509_certificate(ca_cert)
 			.map_err(|_| Error::CouldNotParseCertificate)?;
 
-		Ok(CertificateParams {
+		let params = CertificateParams {
 			basic_constraints: BasicConstraints::from_x509(&x509)?,
 			subject_alt_names: GeneralName::from_x509(&x509)?,
 			key_usages: KeyUsagePurpose::from_x509(&x509)?,
@@ -190,7 +190,9 @@ impl CertificateParams {
 			not_before: x509.validity().not_before.to_datetime(),
 			not_after: x509.validity().not_after.to_datetime(),
 			..Default::default()
-		})
+		};
+		params.validate_name_constraints()?;
+		Ok(params)
 	}
 
 	/// Returns the X.509 extensions for a CSR extension request attribute as defined
@@ -390,6 +392,8 @@ impl CertificateParams {
 		pub_key_spki: &[u8],
 		issuer: &Issuer<'_, impl SigningKey>,
 	) -> Result<Extensions<'_>, Error> {
+		self.validate_name_constraints()?;
+
 		let mut exts = Extensions::default();
 
 		if self.use_authority_key_identifier_extension {
@@ -415,6 +419,15 @@ impl CertificateParams {
 		}
 
 		Ok(exts)
+	}
+
+	fn validate_name_constraints(&self) -> Result<(), Error> {
+		if self.name_constraints.is_some()
+			&& !matches!(self.basic_constraints, Some(BasicConstraints::Ca(_)))
+		{
+			return Err(Error::NameConstraintsRequireCa);
+		}
+		Ok(())
 	}
 
 	/// Insert an extended key usage (EKU) into the parameters if it does not already exist
@@ -633,6 +646,66 @@ mod tests {
 					include_excluded.then_some(1)
 				);
 			}
+		}
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn name_constraints_encode_normalized_exact_and_subtree_domains() {
+		let constraints = NameConstraints::new(
+			vec![
+				GeneralSubtree::DnsName(".Sub.Example.COM.".into()),
+				GeneralSubtree::DnsName("API.Example.COM".into()),
+			],
+			vec![GeneralSubtree::DnsName("Blocked.Example.COM".into())],
+		)
+		.unwrap();
+		let params = CertificateParams {
+			basic_constraints: Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained)),
+			name_constraints: Some(constraints.clone()),
+			..CertificateParams::default()
+		};
+		let (key, _) = KeyPair::generate().unwrap();
+		let cert = params.self_signed(&key).unwrap();
+
+		let parsed = CertificateParams::from_ca_cert_der(cert.der()).unwrap();
+		assert_eq!(parsed.name_constraints, Some(constraints));
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn name_constraints_require_ca_basic_constraints() {
+		let (key, _) = KeyPair::generate().unwrap();
+		let constraints = || {
+			NameConstraints::new(
+				vec![GeneralSubtree::DnsName("example.com".into())],
+				Vec::new(),
+			)
+			.unwrap()
+		};
+
+		for basic_constraints in [None, Some(BasicConstraints::EndEntity)] {
+			let params = CertificateParams {
+				basic_constraints,
+				name_constraints: Some(constraints()),
+				..CertificateParams::default()
+			};
+			assert_eq!(
+				params.self_signed(&key).unwrap_err(),
+				Error::NameConstraintsRequireCa
+			);
+		}
+
+		for basic_constraints in [
+			BasicConstraints::Ca(PathLenConstraint::Unconstrained),
+			BasicConstraints::Ca(PathLenConstraint::Constrained(0)),
+		] {
+			let params = CertificateParams {
+				basic_constraints: Some(basic_constraints),
+				name_constraints: Some(constraints()),
+				..CertificateParams::default()
+			};
+			assert!(params.self_signed(&key).is_ok());
 		}
 	}
 

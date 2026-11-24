@@ -592,8 +592,24 @@ impl StaticExtension for NameConstraints {
 /// The [NameConstraints extension](https://tools.ietf.org/html/rfc5280#section-4.2.1.10)
 /// (only relevant for CA certificates).
 ///
+/// DNS names are normalized before encoding: comparison is case-insensitive and
+/// a single trailing root dot is removed. A leading dot is meaningful and is
+/// preserved:
+///
+/// - `.example.com` constrains every subdomain of `example.com`.
+/// - `example.com` constrains only the name `example.com` itself.
+///
+/// Use the leading-dot form when the intent is to cover a domain's subdomains.
+///
+/// Wildcard labels such as `*.example.com` are not part of the DNS name
+/// constraint syntax and are rejected with a suggested leading-dot form. IDNs
+/// must be supplied in their ASCII A-label (punycode) form. Empty names are
+/// rejected because several validators interpret them as matching every name.
+///
 /// At least one permitted or excluded subtree is required. Use
 /// [`CertificateParams::name_constraints`] set to `None` to omit the extension.
+/// The extension is only emitted for certificates whose
+/// [`CertificateParams::basic_constraints`] marks them as a CA.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct NameConstraints {
 	/// A list of subtrees that the domain has to match.
@@ -635,16 +651,22 @@ impl NameConstraints {
 
 	/// Construct name constraints with permitted and excluded subtrees.
 	///
-	/// Returns an error if both lists are empty or a DNS or email name is not ASCII.
+	/// Returns an error if both lists are empty, if a DNS or email name is not
+	/// ASCII, or if a name is not a valid constraint. Valid DNS and email names
+	/// are normalized before they are stored, so the encoded extension is
+	/// independent of input case and a trailing root dot.
 	pub fn new(
-		permitted_subtrees: Vec<GeneralSubtree>,
-		excluded_subtrees: Vec<GeneralSubtree>,
+		mut permitted_subtrees: Vec<GeneralSubtree>,
+		mut excluded_subtrees: Vec<GeneralSubtree>,
 	) -> Result<Self, Error> {
 		if permitted_subtrees.is_empty() && excluded_subtrees.is_empty() {
 			return Err(Error::EmptyNameConstraints);
 		}
-		for subtree in permitted_subtrees.iter().chain(&excluded_subtrees) {
-			Self::validate_subtree(subtree)?;
+		for subtree in permitted_subtrees
+			.iter_mut()
+			.chain(excluded_subtrees.iter_mut())
+		{
+			Self::normalize_subtree(subtree)?;
 		}
 		Ok(Self {
 			permitted_subtrees,
@@ -652,16 +674,224 @@ impl NameConstraints {
 		})
 	}
 
-	fn validate_subtree(subtree: &GeneralSubtree) -> Result<(), Error> {
+	fn normalize_subtree(subtree: &mut GeneralSubtree) -> Result<(), Error> {
 		match subtree {
-			GeneralSubtree::DnsName(name) | GeneralSubtree::Rfc822Name(name)
-				if !name.is_ascii() =>
-			{
-				Err(Error::InvalidAsn1String(InvalidAsn1String::Ia5String(
-					name.clone(),
-				)))
+			GeneralSubtree::DnsName(name) => {
+				*name = Self::normalize_dns_name(name, true)?;
+				Ok(())
 			},
-			_ => Ok(()),
+			GeneralSubtree::Rfc822Name(name) => {
+				*name = Self::normalize_rfc822_name(name)?;
+				Ok(())
+			},
+			GeneralSubtree::DirectoryName(_) | GeneralSubtree::IpAddress(_) => Ok(()),
+		}
+	}
+
+	fn normalize_dns_name(name: &str, allow_leading_dot: bool) -> Result<String, Error> {
+		if !name.is_ascii() {
+			return Err(Error::InvalidAsn1String(InvalidAsn1String::Ia5String(
+				name.to_owned(),
+			)));
+		}
+
+		let original = name;
+		if original.is_empty() {
+			return Err(Self::invalid_name_constraint(
+				original,
+				"an empty DNS name constraint matches every name",
+				None,
+			));
+		}
+
+		let (leading_dot, name) = match original.strip_prefix('.') {
+			Some(rest) if allow_leading_dot => (true, rest),
+			Some(_) => {
+				return Err(Self::invalid_name_constraint(
+					original,
+					"a leading dot is only valid at the start of the DNS constraint",
+					None,
+				))
+			},
+			None => (false, original),
+		};
+
+		// A trailing dot denotes the DNS root and does not change the subtree.
+		let domain = name.strip_suffix('.').unwrap_or(name);
+		if domain.is_empty() {
+			return Err(Self::invalid_name_constraint(
+				original,
+				"the constraint does not contain a domain name",
+				None,
+			));
+		}
+
+		if domain.contains('*') {
+			let suggestion = domain
+				.strip_prefix("*.")
+				.filter(|rest| !rest.is_empty() && !rest.contains('*'))
+				.and_then(|rest| Self::normalize_dns_name(rest, false).ok())
+				.map(|rest| format!(".{rest}"));
+			return Err(Self::invalid_name_constraint(
+				original,
+				"wildcard labels are not part of DNS name constraints; use a leading-dot subtree",
+				suggestion,
+			));
+		}
+
+		let mut normalized = String::with_capacity(name.len() + usize::from(leading_dot));
+		if leading_dot {
+			normalized.push('.');
+		}
+
+		for label in domain.split('.') {
+			if label.is_empty() {
+				return Err(Self::invalid_name_constraint(
+					original,
+					"DNS names must not contain empty labels",
+					None,
+				));
+			}
+			if label.len() > 63 {
+				return Err(Self::invalid_name_constraint(
+					original,
+					"DNS labels must not exceed 63 octets",
+					None,
+				));
+			}
+			if label.starts_with('-') || label.ends_with('-') {
+				return Err(Self::invalid_name_constraint(
+					original,
+					"DNS labels must not start or end with a hyphen",
+					None,
+				));
+			}
+			if !label
+				.bytes()
+				.all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+			{
+				return Err(Self::invalid_name_constraint(
+					original,
+					"DNS labels may only contain ASCII letters, digits, and hyphens",
+					None,
+				));
+			}
+
+			if normalized.len() > usize::from(leading_dot) {
+				normalized.push('.');
+			}
+			normalized.push_str(&label.to_ascii_lowercase());
+		}
+
+		if normalized.len() - usize::from(leading_dot) > 253 {
+			return Err(Self::invalid_name_constraint(
+				original,
+				"DNS names must not exceed 253 octets",
+				None,
+			));
+		}
+
+		Ok(normalized)
+	}
+
+	fn normalize_rfc822_name(name: &str) -> Result<String, Error> {
+		if !name.is_ascii() {
+			return Err(Error::InvalidAsn1String(InvalidAsn1String::Ia5String(
+				name.to_owned(),
+			)));
+		}
+
+		if name.is_empty() {
+			return Err(Self::invalid_name_constraint(
+				name,
+				"an empty rfc822Name constraint matches every address",
+				None,
+			));
+		}
+		if name
+			.bytes()
+			.any(|byte| byte.is_ascii_control() || byte == b' ')
+		{
+			return Err(Self::invalid_name_constraint(
+				name,
+				"rfc822Name constraints must not contain whitespace or control characters",
+				None,
+			));
+		}
+		if name.contains('*') {
+			let suggestion = name
+				.strip_prefix("*@")
+				.filter(|rest| !rest.contains('*'))
+				.and_then(|rest| Self::normalize_dns_name(rest, true).ok())
+				.or_else(|| {
+					name.strip_prefix("*.")
+						.filter(|rest| !rest.is_empty() && !rest.contains('*'))
+						.and_then(|rest| Self::normalize_dns_name(rest, false).ok())
+						.map(|rest| format!(".{rest}"))
+				});
+			return Err(Self::invalid_name_constraint(
+				name,
+				"wildcard labels are not part of rfc822Name constraints",
+				suggestion,
+			));
+		}
+
+		if let Some(domain) = name.strip_prefix('.') {
+			let domain = Self::normalize_dns_name(domain, false)
+				.map_err(|err| Self::with_constraint_name(err, name))?;
+			return Ok(format!(".{domain}"));
+		}
+
+		if let Some((local_part, domain)) = name.split_once('@') {
+			if local_part.is_empty() {
+				return Err(Self::invalid_name_constraint(
+					name,
+					"the mailbox local part must not be empty",
+					None,
+				));
+			}
+			if local_part.starts_with('.')
+				|| local_part.ends_with('.')
+				|| local_part.contains("..")
+			{
+				return Err(Self::invalid_name_constraint(
+					name,
+					"the mailbox local part must be a non-empty dot-atom",
+					None,
+				));
+			}
+			let domain = Self::normalize_dns_name(domain, false)
+				.map_err(|err| Self::with_constraint_name(err, name))?;
+			return Ok(format!("{local_part}@{domain}"));
+		}
+
+		Self::normalize_dns_name(name, false)
+	}
+
+	fn invalid_name_constraint(
+		name: &str,
+		reason: &str,
+		suggestion: Option<String>,
+	) -> Error {
+		Error::InvalidNameConstraint {
+			name: name.to_owned(),
+			reason: reason.to_owned(),
+			suggestion,
+		}
+	}
+
+	fn with_constraint_name(error: Error, name: &str) -> Error {
+		match error {
+			Error::InvalidNameConstraint {
+				reason,
+				suggestion,
+				..
+			} => Error::InvalidNameConstraint {
+				name: name.to_owned(),
+				reason,
+				suggestion,
+			},
+			other => other,
 		}
 	}
 }
@@ -675,8 +905,18 @@ impl NameConstraints {
 /// For example, `GeneralSubtree` has CIDR subnets for ip addresses
 /// while [`GeneralName`] has IP addresses.
 pub enum GeneralSubtree {
-	/// Also known as E-Mail address
+	/// Also known as E-Mail address.
+	///
+	/// `user@example.com` constrains that mailbox, `example.com` constrains
+	/// mailboxes at that host, and `.example.com` constrains mailboxes in the
+	/// domain and its subdomains. Wildcards are not supported.
 	Rfc822Name(String),
+	/// A DNS name constraint.
+	///
+	/// `.example.com` matches every subdomain of `example.com`, while
+	/// `example.com` matches only `example.com` itself. DNS names are compared
+	/// case-insensitively, so the constraint is normalized to lowercase before
+	/// encoding. Wildcards are not supported; use the leading-dot form instead.
 	DnsName(String),
 	DirectoryName(DistinguishedName),
 	IpAddress(CidrSubnet),
@@ -1403,6 +1643,99 @@ mod tests {
 				NameConstraints::new(Vec::new(), vec![subtree]),
 				Err(Error::InvalidAsn1String(_))
 			));
+		}
+	}
+
+	#[test]
+	fn name_constraints_normalize_dns_and_email_names() {
+		let constraints = NameConstraints::new(
+			vec![
+				GeneralSubtree::DnsName("Example.COM.".into()),
+				GeneralSubtree::DnsName(".Sub.Example.COM.".into()),
+				GeneralSubtree::Rfc822Name("User@Example.COM.".into()),
+			],
+			vec![
+				GeneralSubtree::DnsName("Blocked.Example.COM".into()),
+				GeneralSubtree::Rfc822Name(".Blocked.Example.COM.".into()),
+			],
+		)
+		.unwrap();
+
+		assert_eq!(
+			constraints.permitted_subtrees,
+			vec![
+				GeneralSubtree::DnsName("example.com".into()),
+				GeneralSubtree::DnsName(".sub.example.com".into()),
+				GeneralSubtree::Rfc822Name("User@example.com".into()),
+			]
+		);
+		assert_eq!(
+			constraints.excluded_subtrees,
+			vec![
+				GeneralSubtree::DnsName("blocked.example.com".into()),
+				GeneralSubtree::Rfc822Name(".blocked.example.com".into()),
+			]
+		);
+	}
+
+	#[test]
+	fn name_constraints_reject_empty_and_wildcard_dns_names() {
+		for (name, suggestion) in [
+			("", None),
+			(".", None),
+			("..example.com", None),
+			("example..com", None),
+			("-example.com", None),
+			("example-.com", None),
+			("_service.example.com", None),
+			("example.com..", None),
+			("*", None),
+			("*.example.com", Some(".example.com")),
+			("*.Example.COM.", Some(".example.com")),
+			("*.*.example.com", None),
+		] {
+			let err = NameConstraints::new(
+				vec![GeneralSubtree::DnsName(name.into())],
+				Vec::new(),
+			)
+			.unwrap_err();
+			match err {
+				Error::InvalidNameConstraint {
+					name: invalid,
+					suggestion: actual,
+					..
+				} => {
+					assert_eq!(invalid, name);
+					assert_eq!(actual.as_deref(), suggestion);
+				},
+				other => panic!("unexpected error for {name:?}: {other:?}"),
+			}
+		}
+	}
+
+	#[test]
+	fn name_constraints_reject_invalid_rfc822_names() {
+		for name in [
+			"",
+			".",
+			"@example.com",
+			"user@",
+			"user@example..com",
+			"user@@example.com",
+			".user@example.com",
+			"user name@example.com",
+			"*.example.com",
+			"*@example.com",
+			"user@*.example.com",
+		] {
+			assert!(
+				NameConstraints::new(
+					vec![GeneralSubtree::Rfc822Name(name.into())],
+					Vec::new(),
+				)
+				.is_err(),
+				"expected {name:?} to be rejected"
+			);
 		}
 	}
 

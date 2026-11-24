@@ -47,6 +47,17 @@ pub enum Error {
 	IssuerNotCrlSigner,
 	/// Name constraints must contain at least one permitted or excluded subtree.
 	EmptyNameConstraints,
+	/// A name constraint is syntactically invalid or has no useful semantics.
+	InvalidNameConstraint {
+		/// The constraint as provided by the caller.
+		name: String,
+		/// Why the constraint was rejected.
+		reason: String,
+		/// A canonical replacement for the rejected constraint, when one exists.
+		suggestion: Option<String>,
+	},
+	/// Name constraints may only be included in CA certificates.
+	NameConstraintsRequireCa,
 	/// A CRL distribution point was specified without any URIs.
 	EmptyCrlDistributionPointUris,
 	/// Two extensions have the same OID.
@@ -106,6 +117,21 @@ impl fmt::Display for Error {
 			EmptyNameConstraints => {
 				write!(f, "Name constraints must include at least one subtree")?
 			},
+			InvalidNameConstraint {
+				name,
+				reason,
+				suggestion,
+			} => {
+				write!(f, "Invalid name constraint `{name}`: {reason}")?;
+				if let Some(suggestion) = suggestion {
+					write!(f, "; use `{suggestion}` instead")?;
+				}
+			},
+			NameConstraintsRequireCa => write!(
+				f,
+				"Name constraints may only be included in CA certificates; \
+				set basic_constraints to BasicConstraints::Ca(..)"
+			)?,
 			EmptyCrlDistributionPointUris => {
 				write!(f, "CRL distribution points must include at least one URI")?
 			},
