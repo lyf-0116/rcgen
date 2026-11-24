@@ -70,6 +70,13 @@ pub struct CertificateParams {
 	pub basic_constraints: Option<BasicConstraints>,
 	pub key_usages: Vec<KeyUsagePurpose>,
 	pub extended_key_usages: Vec<ExtendedKeyUsagePurpose>,
+	/// Opt in to conservative extended key usage defaults.
+	///
+	/// This defaults to `false`, making [`Self::extended_key_usages`] authoritative:
+	/// a non-empty list is emitted exactly as configured, and an empty list omits
+	/// the extension. When `true`, an empty list is resolved using rcgen's shared
+	/// CA/subject-name defaults.
+	pub auto_extended_key_usages: bool,
 	pub name_constraints: Option<NameConstraints>,
 	/// An optional list of certificate revocation list (CRL) distribution points as described
 	/// in RFC 5280 Section 4.2.1.13[^1]. Each distribution point contains one or more URIs where
@@ -102,6 +109,7 @@ impl Default for CertificateParams {
 			basic_constraints: None,
 			key_usages: Vec::new(),
 			extended_key_usages: Vec::new(),
+			auto_extended_key_usages: false,
 			name_constraints: None,
 			crl_distribution_points: Vec::new(),
 			custom_extensions: Vec::new(),
@@ -115,6 +123,40 @@ impl Default for CertificateParams {
 }
 
 impl CertificateParams {
+	/// Returns the shared default extended key usage set for these parameters.
+	///
+	/// CA certificates do not receive a leaf key-purpose restriction. End-entity
+	/// certificates that identify a server receive server authentication; other
+	/// end-entity certificates default to client authentication.
+	fn default_extended_key_usages(&self) -> &'static [ExtendedKeyUsagePurpose] {
+		if matches!(
+			self.basic_constraints,
+			Some(BasicConstraints::Ca(_))
+		) {
+			&[]
+		} else if self.subject_alt_names.iter().any(|name| {
+			matches!(
+				name,
+				GeneralName::DnsName(_) | GeneralName::IpAddress(_) | GeneralName::URI(_)
+			)
+		}) {
+			&[ExtendedKeyUsagePurpose::ServerAuth]
+		} else {
+			&[ExtendedKeyUsagePurpose::ClientAuth]
+		}
+	}
+
+	/// Resolves the EKUs that should be encoded in a certificate.
+	///
+	/// Explicitly configured usages always win and are never merged with defaults.
+	fn resolved_extended_key_usages(&self) -> &[ExtendedKeyUsagePurpose] {
+		if self.auto_extended_key_usages && self.extended_key_usages.is_empty() {
+			self.default_extended_key_usages()
+		} else {
+			&self.extended_key_usages
+		}
+	}
+
 	/// Generate certificate parameters with reasonable defaults
 	pub fn new(subject_alt_names: impl Into<Vec<String>>) -> Result<Self, Error> {
 		let subject_alt_names = subject_alt_names
@@ -256,6 +298,7 @@ impl CertificateParams {
 			basic_constraints,
 			key_usages,
 			extended_key_usages,
+			auto_extended_key_usages,
 			name_constraints,
 			crl_distribution_points,
 			custom_extensions,
@@ -278,6 +321,7 @@ impl CertificateParams {
 			subject_alt_names,
 			key_usages,
 			extended_key_usages,
+			auto_extended_key_usages,
 			basic_constraints,
 			custom_extensions,
 		);
@@ -398,7 +442,8 @@ impl CertificateParams {
 
 		exts.push_if_some(SubjectAlternativeName::from_params(self))?;
 		exts.push_if_some(NonEmptySlice::new(&self.key_usages))?;
-		exts.push_if_some(NonEmptySlice::new(&self.extended_key_usages))?;
+		let extended_key_usages = self.resolved_extended_key_usages();
+		exts.push_if_some(NonEmptySlice::new(extended_key_usages))?;
 		exts.push_if_some(self.name_constraints.as_ref())?;
 		exts.push_if_some(NonEmptySlice::new(&self.crl_distribution_points))?;
 
@@ -528,12 +573,18 @@ mod tests {
 
 	#[cfg(feature = "pem")]
 	use super::*;
+	use crate::{
+		BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, GeneralName,
+		PathLenConstraint,
+	};
 	#[cfg(feature = "x509-parser")]
 	use crate::DnValue;
 	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
 	use crate::GeneralSubtree;
 	#[cfg(feature = "crypto")]
-	use crate::{KeyPair, PathLenConstraint};
+	use crate::KeyPair;
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	use crate::Issuer;
 
 	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
 	#[test]
@@ -890,6 +941,90 @@ mod tests {
 
 		let expected_oids = vec![Oid::from(OID_1).unwrap(), Oid::from(OID_2).unwrap()];
 		assert_eq!(extension.value.other, expected_oids);
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn explicit_extended_key_usage_is_not_augmented_with_defaults() {
+		let (key_pair, _) = KeyPair::generate().unwrap();
+
+		for expected_usage in [
+			ExtendedKeyUsagePurpose::ClientAuth,
+			ExtendedKeyUsagePurpose::ServerAuth,
+		] {
+			let mut params = CertificateParams::new(vec!["example.com".to_owned()]).unwrap();
+			params.auto_extended_key_usages = true;
+			params.extended_key_usages = vec![expected_usage.clone()];
+
+			let cert = params.self_signed(&key_pair).unwrap();
+			let (_remainder, parsed) =
+				x509_parser::parse_x509_certificate(cert.der()).unwrap();
+			let extension = parsed.extended_key_usage().unwrap().unwrap();
+
+			assert_eq!(
+				extension.value.client_auth,
+				expected_usage == ExtendedKeyUsagePurpose::ClientAuth
+			);
+			assert_eq!(
+				extension.value.server_auth,
+				expected_usage == ExtendedKeyUsagePurpose::ServerAuth
+			);
+			assert!(!extension.value.code_signing);
+			assert!(!extension.value.email_protection);
+			assert!(!extension.value.time_stamping);
+			assert!(!extension.value.ocsp_signing);
+		}
+	}
+
+	#[test]
+	fn default_extended_key_usages_follow_ca_and_subject_names() {
+		let mut params = CertificateParams::default();
+		assert_eq!(
+			params.default_extended_key_usages(),
+			&[ExtendedKeyUsagePurpose::ClientAuth]
+		);
+
+		params
+			.subject_alt_names
+			.push(GeneralName::DnsName("example.com".try_into().unwrap()));
+		assert_eq!(
+			params.default_extended_key_usages(),
+			&[ExtendedKeyUsagePurpose::ServerAuth]
+		);
+
+		params.basic_constraints = Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
+		assert!(params.default_extended_key_usages().is_empty());
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn automatic_extended_key_usages_match_on_self_signed_and_issued_paths() {
+		let (subject_key, _) = KeyPair::generate().unwrap();
+		let (issuer_key, _) = KeyPair::generate().unwrap();
+		let mut issuer_params = CertificateParams::new(vec!["ca.example.com".to_owned()]).unwrap();
+		issuer_params.basic_constraints =
+			Some(BasicConstraints::Ca(PathLenConstraint::Unconstrained));
+		let ca_cert = issuer_params.self_signed(&issuer_key).unwrap();
+
+		let mut params = CertificateParams::new(vec!["ee.example.com".to_owned()]).unwrap();
+		params.auto_extended_key_usages = true;
+
+		let self_signed = params.self_signed(&subject_key).unwrap();
+		let issued = params
+			.signed_by(&subject_key, &Issuer::new(issuer_params, issuer_key))
+			.unwrap();
+
+		let (_remainder, parsed_ca) =
+			x509_parser::parse_x509_certificate(ca_cert.der()).unwrap();
+		assert!(parsed_ca.extended_key_usage().unwrap().is_none());
+
+		for cert in [self_signed, issued] {
+			let (_remainder, parsed) =
+				x509_parser::parse_x509_certificate(cert.der()).unwrap();
+			let extension = parsed.extended_key_usage().unwrap().unwrap();
+			assert!(extension.value.server_auth);
+			assert!(!extension.value.client_auth);
+		}
 	}
 
 	#[cfg(feature = "pem")]

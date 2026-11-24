@@ -20,6 +20,7 @@ fn main() -> anyhow::Result<()> {
 
 	let mut entity = CertificateBuilder::new()
 		.signature_algorithm(opts.keypair_algorithm)?
+		.auto_extended_key_usages(opts.auto_extended_key_usages)
 		.end_entity()
 		.common_name(&opts.common_name)
 		.subject_alternative_names(opts.san);
@@ -64,6 +65,9 @@ struct Options {
 	/// Extended Key Usage Purpose: ServerAuth
 	#[bpaf(long)]
 	pub server_auth: bool,
+	/// Derive default Extended Key Usage when neither explicit usage is selected
+	#[bpaf(long)]
+	pub auto_extended_key_usages: bool,
 	/// Basename for end-entity cert/key
 	#[bpaf(long, fallback("cert".into()), display_fallback)]
 	pub cert_file_name: String,

@@ -41,6 +41,11 @@ impl CertificateBuilder {
 		self.alg = alg;
 		Ok(self)
 	}
+	/// Opt in to automatic extended key usage derivation for an empty explicit list.
+	pub fn auto_extended_key_usages(mut self, enable: bool) -> Self {
+		self.params.auto_extended_key_usages = enable;
+		self
+	}
 	/// Set options for Ca Certificates
 	/// # Example
 	/// ```
