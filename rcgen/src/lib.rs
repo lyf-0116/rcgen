@@ -49,7 +49,9 @@ use yasna::tags::{TAG_BMPSTRING, TAG_TELETEXSTRING, TAG_UNIVERSALSTRING};
 use yasna::DERWriter;
 
 mod certificate;
-pub use certificate::{date_time_ymd, Attribute, Certificate, CertificateParams, DnType};
+pub use certificate::{
+	date_time_ymd, Attribute, Certificate, CertificateParams, DnType, SerialNumberParams,
+};
 
 mod crl;
 pub use crl::{

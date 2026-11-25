@@ -14,7 +14,12 @@ use crate::extension::{
 };
 use crate::key_pair::{serialize_public_key_der, sign_der, PublicKeyData};
 #[cfg(feature = "crypto")]
-use crate::ring_like::digest;
+use crate::error::ExternalError;
+#[cfg(feature = "crypto")]
+use crate::ring_like::{
+	digest,
+	rand::{self, SecureRandom},
+};
 #[cfg(feature = "pem")]
 use crate::ENCODE_CONFIG;
 use crate::{
@@ -22,6 +27,58 @@ use crate::{
 	CrlDistributionPoint, CustomExtension, DistinguishedName, Error, ExtendedKeyUsagePurpose,
 	GeneralName, Issuer, KeyIdMethod, KeyUsagePurpose, NameConstraints, SerialNumber, SigningKey,
 };
+
+/// How a certificate's serial number is determined, as held in
+/// [`CertificateParams::serial_number`].
+///
+/// RFC 5280 requires serial numbers to be unique integers assigned by the CA
+/// for the lifetime of a certificate: CRLs and OCSP responses identify the
+/// certificate to revoke by its serial number, so two certificates issued with
+/// the same serial number cannot be revoked independently.
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[non_exhaustive]
+pub enum SerialNumberParams {
+	/// Use the exact, caller-provided serial number.
+	Explicit(SerialNumber),
+	/// Generate a fresh, random 20-byte serial number for every certificate.
+	///
+	/// The high bit of the first byte is cleared so that the value is always a
+	/// positive integer and its DER encoding stays within the RFC 5280 limit of
+	/// 20 octets. This is the default and gives each issued certificate a
+	/// unique (with overwhelming probability) serial number even when the same
+	/// key is signed repeatedly (renewal, re-signing, multiple subjects).
+	#[cfg(feature = "crypto")]
+	Random,
+	/// Deterministically derive the serial number from the subject public key.
+	///
+	/// The serial number is the first 20 bytes of the SHA-256 digest of the
+	/// public key, with the high bit cleared. This value is stable for a given
+	/// key, which makes certificate generation reproducible, but every
+	/// certificate issued for the same key shares one serial number. Prefer
+	/// [`SerialNumberParams::Random`] unless reproducible builds are required,
+	/// and avoid issuing more than one certificate per key with this mode.
+	#[cfg(feature = "crypto")]
+	PublicKeyHash,
+}
+
+#[cfg(feature = "crypto")]
+impl Default for SerialNumberParams {
+	fn default() -> Self {
+		Self::Random
+	}
+}
+
+#[cfg(feature = "crypto")]
+fn random_serial_number() -> Result<SerialNumber, Error> {
+	let mut bytes = [0u8; 20];
+	let rng = rand::SystemRandom::new();
+	rng.fill(&mut bytes)._err()?;
+	// RFC 5280: serial numbers are positive integers of at most 20 octets.
+	// Clearing the high bit keeps the value positive without adding a leading
+	// zero byte that would push the encoding past the 20-octet limit.
+	bytes[0] &= 0x7f;
+	Ok(SerialNumber::from(bytes.to_vec()))
+}
 
 /// An issued certificate
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +115,14 @@ impl From<Certificate> for CertificateDer<'static> {
 pub struct CertificateParams {
 	pub not_before: OffsetDateTime,
 	pub not_after: OffsetDateTime,
-	pub serial_number: Option<SerialNumber>,
+	/// Determines the certificate's serial number.
+	///
+	/// Defaults to [`SerialNumberParams::Random`] when the `crypto` feature is
+	/// enabled, which issues a unique random serial number per certificate. Use
+	/// [`SerialNumberParams::Explicit`] to set a specific value, or
+	/// [`SerialNumberParams::PublicKeyHash`] for deterministic, reproducible
+	/// certificate generation at the cost of per-key serial uniqueness.
+	pub serial_number: SerialNumberParams,
 	pub subject_alt_names: Vec<GeneralName>,
 	pub distinguished_name: DistinguishedName,
 	/// Basic constraints controlling whether this certificate can act as a certificate authority (CA).
@@ -96,7 +160,10 @@ impl Default for CertificateParams {
 		CertificateParams {
 			not_before,
 			not_after,
-			serial_number: None,
+			#[cfg(feature = "crypto")]
+			serial_number: SerialNumberParams::Random,
+			#[cfg(not(feature = "crypto"))]
+			serial_number: SerialNumberParams::Explicit(SerialNumber::from_slice(&[])),
 			subject_alt_names: Vec::new(),
 			distinguished_name,
 			basic_constraints: None,
@@ -184,7 +251,7 @@ impl CertificateParams {
 			key_usages: KeyUsagePurpose::from_x509(&x509)?,
 			extended_key_usages: ExtendedKeyUsagePurpose::from_x509(&x509)?,
 			name_constraints: NameConstraints::from_x509(&x509)?,
-			serial_number: Some(x509.serial.to_bytes_be().into()),
+			serial_number: SerialNumberParams::Explicit(x509.serial.to_bytes_be().into()),
 			key_identifier_method: KeyIdMethod::from_x509(&x509)?,
 			distinguished_name: DistinguishedName::from_name(&x509.tbs_certificate.subject)?,
 			not_before: x509.validity().not_before.to_datetime(),
@@ -281,7 +348,9 @@ impl CertificateParams {
 			basic_constraints,
 			custom_extensions,
 		);
-		if serial_number.is_some()
+		// CSRs carry no serial number; reject any configuration that would
+		// produce one rather than silently ignoring it.
+		if matches!(serial_number, SerialNumberParams::Explicit(_))
 			|| name_constraints.is_some()
 			|| !crl_distribution_points.is_empty()
 			|| *use_authority_key_identifier_extension
@@ -337,22 +406,8 @@ impl CertificateParams {
 				writer.write_u8(2);
 			});
 			// Write serialNumber
-			if let Some(ref serial) = self.serial_number {
-				writer.next().write_bigint_bytes(serial.as_ref(), true);
-			} else {
-				#[cfg(feature = "crypto")]
-				{
-					let hash = digest::digest(&digest::SHA256, pub_key.der_bytes());
-					// RFC 5280 specifies at most 20 bytes for a serial number
-					let mut sl = hash.as_ref()[0..20].to_vec();
-					sl[0] &= 0x7f; // MSB must be 0 to ensure encoding bignum in 20 bytes
-					writer.next().write_bigint_bytes(&sl, true);
-				}
-				#[cfg(not(feature = "crypto"))]
-				if self.serial_number.is_none() {
-					return Err(Error::MissingSerialNumber);
-				}
-			};
+			let serial = self.resolve_serial_number(pub_key)?;
+			writer.next().write_bigint_bytes(serial.as_ref(), true);
 			// Write signature algorithm
 			issuer
 				.signing_key
@@ -380,6 +435,44 @@ impl CertificateParams {
 		})?;
 
 		Ok(der.into())
+	}
+
+	/// Resolve the serial number to write into the certificate according to
+	/// [`CertificateParams::serial_number`].
+	#[cfg(feature = "crypto")]
+	fn resolve_serial_number<K: PublicKeyData>(
+		&self,
+		pub_key: &K,
+	) -> Result<SerialNumber, Error> {
+		match self.serial_number {
+			SerialNumberParams::Explicit(ref serial) => Ok(serial.clone()),
+			SerialNumberParams::Random => random_serial_number(),
+			SerialNumberParams::PublicKeyHash => {
+				let hash = digest::digest(&digest::SHA256, pub_key.der_bytes());
+				// RFC 5280 specifies at most 20 bytes for a serial number.
+				let mut serial = hash.as_ref()[0..20].to_vec();
+				// MSB must be 0 to keep the value positive within 20 bytes.
+				serial[0] &= 0x7f;
+				Ok(serial.into())
+			},
+		}
+	}
+
+	/// Resolve the serial number to write into the certificate according to
+	/// [`CertificateParams::serial_number`].
+	#[cfg(not(feature = "crypto"))]
+	fn resolve_serial_number<K: PublicKeyData>(
+		&self,
+		_pub_key: &K,
+	) -> Result<SerialNumber, Error> {
+		match self.serial_number {
+			SerialNumberParams::Explicit(ref serial) if !serial.as_ref().is_empty() => {
+				Ok(serial.clone())
+			},
+			// Without the `crypto` feature there is no source of randomness, so
+			// a serial number must always be supplied explicitly.
+			SerialNumberParams::Explicit(_) => Err(Error::MissingSerialNumber),
+		}
 	}
 
 	/// Returns the X.509 extensions that the [`CertificateParams`] describe.
@@ -1128,5 +1221,98 @@ PITGdT9dgN88nHPCle0B1+OY+OZ5
 					.unwrap()
 			);
 		}
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn default_random_serial_numbers_are_unique_per_certificate() {
+		let (key, _) = KeyPair::generate().unwrap();
+
+		let first = CertificateParams::default()
+			.self_signed(&key)
+			.unwrap();
+		let second = CertificateParams::default()
+			.self_signed(&key)
+			.unwrap();
+
+		let (_, first) = x509_parser::parse_x509_certificate(first.der()).unwrap();
+		let (_, second) = x509_parser::parse_x509_certificate(second.der()).unwrap();
+
+		assert_ne!(first.serial, second.serial);
+		assert!(first.serial.to_bytes_be().len() <= 20);
+		assert!(second.serial.to_bytes_be().len() <= 20);
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn public_key_hash_serial_numbers_are_stable_for_a_key() {
+		let (key, _) = KeyPair::generate().unwrap();
+		let params = CertificateParams {
+			serial_number: SerialNumberParams::PublicKeyHash,
+			..CertificateParams::default()
+		};
+
+		let first = params.self_signed(&key).unwrap();
+		let second = params.self_signed(&key).unwrap();
+
+		let (_, first) = x509_parser::parse_x509_certificate(first.der()).unwrap();
+		let (_, second) = x509_parser::parse_x509_certificate(second.der()).unwrap();
+
+		assert_eq!(first.serial, second.serial);
+		let serial = first.serial.to_bytes_be();
+		assert_eq!(serial.len(), 20);
+		// The value must stay a positive integer.
+		assert_eq!(serial[0] & 0x80, 0);
+	}
+
+	#[cfg(all(feature = "crypto", feature = "x509-parser"))]
+	#[test]
+	fn explicit_serial_number_is_written_verbatim() {
+		let (key, _) = KeyPair::generate().unwrap();
+		let params = CertificateParams {
+			serial_number: SerialNumberParams::Explicit(SerialNumber::from(42u64)),
+			..CertificateParams::default()
+		};
+
+		let cert = params.self_signed(&key).unwrap();
+		let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap();
+
+		assert_eq!(parsed.serial.to_bytes_be(), vec![42]);
+	}
+
+	#[cfg(not(feature = "crypto"))]
+	#[test]
+	fn missing_serial_number_is_rejected_without_crypto() {
+		use crate::{
+			CertificateParams, ED25519, Error, PublicKeyData, SignatureAlgorithm, SigningKey,
+		};
+
+		struct StubKey {
+			public_key: Vec<u8>,
+		}
+
+		impl PublicKeyData for StubKey {
+			fn der_bytes(&self) -> &[u8] {
+				&self.public_key
+			}
+
+			fn algorithm(&self) -> &'static SignatureAlgorithm {
+				&ED25519
+			}
+		}
+
+		impl SigningKey for StubKey {
+			fn sign(&self, _msg: &[u8]) -> Result<Vec<u8>, Error> {
+				Ok(Vec::new())
+			}
+		}
+
+		let key = StubKey {
+			public_key: Vec::new(),
+		};
+		let err = CertificateParams::default()
+			.self_signed(&key)
+			.unwrap_err();
+		assert!(matches!(err, Error::MissingSerialNumber));
 	}
 }

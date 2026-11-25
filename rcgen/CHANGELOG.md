@@ -3,6 +3,25 @@
 
 Newer releases can be found [on GitHub](https://github.com/rustls/rcgen/releases).
 
+## Unreleased
+
+Security:
+
+- Certificates generated without an explicit serial number no longer derive it
+  deterministically from the subject public key. That scheme gave every
+  certificate issued for a key (renewals, re-signings, multiple subjects) the
+  same serial number, so revoking one certificate by serial number also
+  implicated the others and made individual revocation unreliable. The default
+  is now a random, positive, at-most-20-octet serial number
+  (`SerialNumberParams::Random`).
+
+Breaking changes:
+
+- `CertificateParams::serial_number` is now a `SerialNumberParams` instead of
+  an `Option<SerialNumber>`. Use `SerialNumberParams::Explicit(..)` to keep a
+  fixed value. The previous public-key-derived behavior is available
+  explicitly via `SerialNumberParams::PublicKeyHash` for reproducible builds.
+
 ## Release 0.13.1 - April 4th, 2024
 
 Fixed:

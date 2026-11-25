@@ -13,7 +13,7 @@ use rcgen::{
 	BasicConstraints, Certificate, CertificateParams, CertificateRevocationListParams, DnType,
 	Error, ExtendedKeyUsagePurpose, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
 	PathLenConstraint, PublicKeyData, RevocationReason, RevokedCertParams, SerialNumber,
-	SigningKey,
+	SerialNumberParams, SigningKey,
 };
 #[cfg(feature = "x509-parser")]
 use rcgen::{CertificateSigningRequestParams, DnValue};
@@ -622,7 +622,7 @@ fn test_certificate_from_csr() {
 #[test]
 fn test_webpki_serial_number() {
 	let (mut params, key_pair, key_der) = util::default_params();
-	params.serial_number = Some(vec![0, 1, 2].into());
+	params.serial_number = SerialNumberParams::Explicit(vec![0, 1, 2].into());
 	let cert = params.self_signed(&key_pair).unwrap();
 
 	// Now verify the certificate.
@@ -686,7 +686,8 @@ fn test_webpki_crl_revoke() {
 	let (mut ee, _, _) = util::default_params();
 	ee.basic_constraints = None;
 	ee.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-	ee.serial_number = Some(SerialNumber::from(99999));
+	let ee_serial = SerialNumber::from(99999);
+	ee.serial_number = SerialNumberParams::Explicit(ee_serial.clone());
 	let (ee_key, _) = KeyPair::generate_for(alg).unwrap();
 	let issuer = Issuer::new(issuer, issuer_key);
 	let ee_cert = ee.signed_by(&ee_key, &issuer).unwrap();
@@ -713,7 +714,7 @@ fn test_webpki_crl_revoke() {
 
 	// Generate a CRL with the issuer that revokes the EE cert.
 	let mut revoked_certs = RevokedCertParams::new(
-		ee.serial_number.clone().unwrap(),
+		ee_serial,
 		OffsetDateTime::from_unix_timestamp(unix_time as i64).unwrap(),
 	);
 	revoked_certs.reason_code = Some(RevocationReason::KeyCompromise);

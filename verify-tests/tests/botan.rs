@@ -3,7 +3,7 @@
 use rcgen::{
 	BasicConstraints, Certificate, CertificateParams, CertificateRevocationListParams, DnType,
 	DnValue, Issuer, KeyPair, KeyUsagePurpose, PathLenConstraint, RevocationReason,
-	RevokedCertParams, SerialNumber,
+	RevokedCertParams, SerialNumber, SerialNumberParams,
 };
 use time::{Duration, OffsetDateTime};
 use verify_tests as util;
@@ -215,7 +215,8 @@ fn test_botan_crl_parse() {
 	// Create an end entity cert issued by the issuer.
 	let (mut ee, _, _) = util::default_params();
 	ee.basic_constraints = None;
-	ee.serial_number = Some(SerialNumber::from(99999));
+	let ee_serial = SerialNumber::from(99999);
+	ee.serial_number = SerialNumberParams::Explicit(ee_serial.clone());
 	// Botan has a sanity check that enforces a maximum expiration date
 	ee.not_after = rcgen::date_time_ymd(3016, 1, 1);
 	let (ee_key, _) = KeyPair::generate_for(alg).unwrap();
@@ -224,7 +225,7 @@ fn test_botan_crl_parse() {
 
 	// Generate a CRL with the issuer that revokes the EE cert.
 	let now = OffsetDateTime::now_utc();
-	let mut revoked_certs = RevokedCertParams::new(ee.serial_number.clone().unwrap(), now);
+	let mut revoked_certs = RevokedCertParams::new(ee_serial, now);
 	revoked_certs.reason_code = Some(RevocationReason::KeyCompromise);
 
 	let mut crl = CertificateRevocationListParams::new(

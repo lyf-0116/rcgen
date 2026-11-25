@@ -1,0 +1,192 @@
+use crate::utils::*;
+use botan_sys::*;
+
+#[derive(Debug)]
+/// A cryptographic random number generator
+pub struct RandomNumberGenerator {
+    obj: botan_rng_t,
+}
+
+unsafe impl Sync for RandomNumberGenerator {}
+unsafe impl Send for RandomNumberGenerator {}
+
+botan_impl_drop!(RandomNumberGenerator, botan_rng_destroy);
+
+impl RandomNumberGenerator {
+    /// Create a new RNG object with a specific type, e.g. "esdm-full"
+    ///
+    /// # Examples
+    /// ```
+    /// // This is just for demonstration, use RandomNumberGenerator::new_userspace() instead.
+    /// let specific_rng = botan::RandomNumberGenerator::new_of_type("user").unwrap();
+    /// ```
+    pub fn new_of_type<T: crate::RngTypeIdentifier>(typ: T) -> Result<RandomNumberGenerator> {
+        let typ = typ.botan_name();
+        let typ = make_cstr(&typ)?;
+        let obj = botan_init!(botan_rng_init, typ.as_ptr())?;
+        Ok(RandomNumberGenerator { obj })
+    }
+
+    pub(crate) fn handle(&mut self) -> botan_rng_t {
+        self.obj
+    }
+
+    /// Create a new userspace RNG object
+    ///
+    /// # Examples
+    /// ```
+    /// let userspace_rng = botan::RandomNumberGenerator::new_userspace().unwrap();
+    /// ```
+    pub fn new_userspace() -> Result<RandomNumberGenerator> {
+        RandomNumberGenerator::new_of_type(crate::RngType::User)
+    }
+
+    /// Create a new reference to the system PRNG
+    ///
+    /// # Examples
+    /// ```
+    /// let system_rng = botan::RandomNumberGenerator::new_system().unwrap();
+    /// ```
+    pub fn new_system() -> Result<RandomNumberGenerator> {
+        RandomNumberGenerator::new_of_type(crate::RngType::System)
+    }
+
+    /// Create a new reference to the ESDM PRNG (fully seeded)
+    ///
+    /// Availability of this RNG depends on botan being compiled
+    /// with ESDM support.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let esdm_rng = botan::RandomNumberGenerator::new_esdm().unwrap();
+    /// ```
+    pub fn new_esdm() -> Result<RandomNumberGenerator> {
+        RandomNumberGenerator::new_of_type(crate::RngType::EsdmFull)
+    }
+
+    /// Create a new reference to the ESDM PRNG (with prediction resistance)
+    ///
+    /// Availability of this RNG depends on botan being compiled
+    /// with ESDM support.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let esdm_rng = botan::RandomNumberGenerator::new_esdm_pr().unwrap();
+    /// ```
+    pub fn new_esdm_pr() -> Result<RandomNumberGenerator> {
+        RandomNumberGenerator::new_of_type(crate::RngType::EsdmPr)
+    }
+
+    /// Create a new reference to the Jitter RNG
+    ///
+    /// Availability of this RNG depends on botan being compiled
+    /// with Jitter RNG support.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let jitter_rng = botan::RandomNumberGenerator::new_jitter().unwrap();
+    /// ```
+    pub fn new_jitter() -> Result<RandomNumberGenerator> {
+        RandomNumberGenerator::new_of_type(crate::RngType::Jitter)
+    }
+
+    /// Create a new reference to an RNG of some arbitrary type
+    ///
+    /// # Examples
+    /// ```
+    /// let a_rng = botan::RandomNumberGenerator::new().unwrap();
+    /// ```
+    pub fn new() -> Result<RandomNumberGenerator> {
+        RandomNumberGenerator::new_userspace()
+    }
+
+    /// Read bytes from an RNG
+    ///
+    /// # Examples
+    /// ```
+    /// let mut rng = botan::RandomNumberGenerator::new().unwrap();
+    /// let output = rng.read(32).unwrap();
+    /// assert_eq!(output.len(), 32);
+    /// ```
+    pub fn read(&mut self, len: usize) -> Result<Vec<u8>> {
+        let mut result = vec![0; len];
+        self.fill(&mut result)?;
+        Ok(result)
+    }
+
+    /// Store bytes from the RNG into the passed slice
+    ///
+    /// # Examples
+    /// ```
+    /// let mut rng = botan::RandomNumberGenerator::new().unwrap();
+    /// let mut output = vec![0; 32];
+    /// rng.fill(&mut output).unwrap();
+    /// ```
+    pub fn fill(&mut self, out: &mut [u8]) -> Result<()> {
+        botan_call!(botan_rng_get, self.obj, out.as_mut_ptr(), out.len())
+    }
+
+    /// Attempt to reseed the RNG by unspecified means
+    ///
+    /// # Examples
+    /// ```
+    /// let mut rng = botan::RandomNumberGenerator::new().unwrap();
+    /// rng.reseed(256).unwrap();
+    /// ```
+    pub fn reseed(&mut self, bits: usize) -> Result<()> {
+        botan_call!(botan_rng_reseed, self.obj, bits)
+    }
+
+    /// Attempt to reseed the RNG by getting data from source RNG
+    ///
+    /// # Examples
+    /// ```
+    /// let mut system_rng = botan::RandomNumberGenerator::new_system().unwrap();
+    /// let mut rng = botan::RandomNumberGenerator::new_userspace().unwrap();
+    /// rng.reseed_from_rng(&mut system_rng, 256).unwrap();
+    /// ```
+    pub fn reseed_from_rng(
+        &mut self,
+        source: &mut RandomNumberGenerator,
+        bits: usize,
+    ) -> Result<()> {
+        botan_call!(botan_rng_reseed_from_rng, self.obj, source.handle(), bits)
+    }
+
+    /// Add some seed material to the RNG
+    ///
+    /// # Examples
+    /// ```
+    /// let mut rng = botan::RandomNumberGenerator::new_userspace().unwrap();
+    /// let my_seed = vec![0x42, 0x6F, 0x62];
+    /// rng.add_entropy(&my_seed);
+    /// ```
+    pub fn add_entropy(&mut self, seed: &[u8]) -> Result<()> {
+        botan_call!(botan_rng_add_entropy, self.obj, seed.as_ptr(), seed.len())
+    }
+}
+
+#[cfg(feature = "rand")]
+impl rand_core::TryRng for RandomNumberGenerator {
+    type Error = Error;
+
+    fn try_next_u32(&mut self) -> Result<u32> {
+        let mut bytes: [u8; 4] = [0; 4];
+        self.fill(&mut bytes)?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64> {
+        let mut bytes: [u8; 8] = [0; 8];
+        self.fill(&mut bytes)?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<()> {
+        self.fill(dst)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "rand")]
+impl rand_core::TryCryptoRng for RandomNumberGenerator {}
